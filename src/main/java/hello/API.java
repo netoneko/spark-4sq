@@ -4,12 +4,17 @@ import static spark.Spark.*;
 
 import spark.*;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
+import javax.json.Json;
+import javax.json.JsonObject;
+import javax.json.JsonReader;
+import javax.json.stream.JsonGenerator;
+import java.io.StringWriter;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.util.Locale;
+import java.util.concurrent.*;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -24,34 +29,59 @@ public class API {
 
     }
 
+    static class LatLon {
+        final String lat;
+        final String lon;
+
+        LatLon(String lat, String lon) {
+            this.lat = lat;
+            this.lon = lon;
+        }
+
+        @Override
+        public String toString() {
+            return String.format("%s,%s", lat, lon);
+        }
+    }
+
     static final Function<String, String> credentials = (String url) -> {
         return String.format(locale, "%s&client_id=%s&clientSecret=%s&v=%s",
                 url, Credentials.clientId, Credentials.clientSecret, Credentials.version);
     };
 
-    static final Function<String, String> readUrl = (String url) -> {
+    static final JsonReader readUrl(String url) {
         try {
-            final URL oracle = new URL(url);
-            final BufferedReader in = new BufferedReader(new InputStreamReader(oracle.openStream()));
-
-            final StringBuffer result = new StringBuffer();
-            String inputLine;
-            while ((inputLine = in.readLine()) != null)
-                result.append(inputLine).append("\n");
-
-            in.close();
-
-            return result.toString();
+            logger.info(url);
+            return Json.createReader(new URL(url).openStream());
         } catch (Exception e) {
             logger.log(Level.WARNING, e.getMessage());
+            return null;
         }
+    }
 
-        return "";
-    };
+    static final Supplier<LatLon> getLocation(String address) {
+        return () -> {
+            String url = "http://nominatim.openstreetmap.org/search.php?format=json&q=" + URLEncoder.encode(address);
+            JsonObject location = readUrl(url).readArray().getJsonObject(0);
+            logger.info(location.toString());
 
-    static final Function<String, String> getLocationData = (String address) -> {
-        return readUrl.apply("http://nominatim.openstreetmap.org/search.php?format=json&q="
-                + URLEncoder.encode(address));
+            return new LatLon(location.getString("lat"), location.getString("lon"));
+        };
+    }
+
+    static final Function<LatLon, String> writeLatLon = (LatLon latLon) -> {
+        logger.info(latLon.toString());
+
+        StringWriter stringWriter = new StringWriter();
+        JsonGenerator generator = Json.createGenerator(stringWriter);
+
+        generator.writeStartObject()
+                .write("lat", latLon.lat)
+                .write("lon", latLon.lon)
+                .writeEnd();
+
+        generator.close();
+        return stringWriter.toString();
     };
 
     public static void main(String[] args) {
@@ -63,13 +93,19 @@ public class API {
                 logger.log(Level.INFO, "Address: " + address);
 
                 if (address == null || address.isEmpty()) {
-                    return "{}";
+                    return "{\"error\": \"Empty address\"}";
                 } else {
-                    return getLocationData.apply(address);
+                    CompletableFuture<LatLon> f = CompletableFuture.supplyAsync(getLocation(address));
+                    CompletableFuture<String> result = f.thenApplyAsync(writeLatLon);
+
+                    try {
+                        return result.get(500, TimeUnit.MILLISECONDS);
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                        return "{\"error\": \"External API timeout\"}";
+                    }
                 }
             }
         });
-
     }
-
 }
